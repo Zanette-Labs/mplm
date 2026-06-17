@@ -4,17 +4,21 @@ This repository holds data-generation and inference scripts for evaluating
 **MPLM** (a multi-agent, message-passing language-model protocol with
 `<spawn>` / `<send>` / `<recv>` / `<stop>` directives) on three task families:
 
-| Directory          | Task                           | Data generators                 | Inference / eval script                                   |
-| ------------------ | ------------------------------ | ------------------------------- | --------------------------------------------------------- |
-| `sudoku/`          | N×N Sudoku                     | `mplm.py`, `fj.py`, `serial.py` | `infer.py`                                             |
-| `sat/`             | 3-SAT (SAT / UNSAT)            | `mplm.py`, `fj.py`, `serial.py` | `infer.py`                                             |
-| `long_context_qa/` | LongBench-v2 (long-context QA) | *(none — use the HF dataset)*   | `run_mplm_longbenchv2.py`, `run_rlm_longbenchv2.py`       |
+| Directory          | Task                           | Problem generator     | Trace generators                | Inference / eval script                             |
+| ------------------ | ------------------------------ | --------------------- | ------------------------------- | --------------------------------------------------- |
+| `sudoku/`          | N×N Sudoku                     | `generate_sudoku.py`  | `mplm.py`, `fj.py`, `serial.py` | `infer.py`                                          |
+| `sat/`             | 3-SAT (SAT / UNSAT)            | `generate_sat.py`     | `mplm.py`, `fj.py`, `serial.py` | `infer.py`                                          |
+| `long_context_qa/` | LongBench-v2 (long-context QA) | *(use the HF dataset)* | *(none)*                       | `run_mplm_longbenchv2.py`, `run_rlm_longbenchv2.py` |
 
-For every task there are two distinct data artifacts:
+Each task's pipeline is: a **problem generator** emits raw instances, the
+`mplm`/`fj`/`serial` **trace generators** turn those instances into multi-agent
+traces, and the **inference script** evaluates a trained model. There are two
+distinct data artifacts:
 
 * **Training data** — multi-agent traces produced by the `mplm`/`fj`/`serial`
   generators, used to SFT the model.
-* **Evaluation data** — the held-out instances fed to the inference scripts.
+* **Evaluation data** — the held-out instances fed to the inference scripts
+  (the same problem generator produces both — just generate a separate split).
 
 The three generators per task differ only in the *solving strategy* they
 record, not in the output schema:
@@ -51,36 +55,41 @@ key `EMPTY`; override with the `--vllm-url` / `--served-model-name` / `--api-key
 flags or the `VLLM_URL` / `VLLM_MODEL_NAME` / `VLLM_API_KEY` environment
 variables. Use `CUDA_VISIBLE_DEVICES` to pin a server to specific GPUs.
 
-> **Tip:** launch the eval scripts with your environment's Python binary
-> directly (e.g. `</path/to/env>/bin/python infer.py ...`, or after
-> `conda activate <env>`) rather than through `conda run`; the latter buffers
-> stdout and hides the per-task progress these scripts stream as they go.
-
 ---
 
 ## 1. Sudoku (`sudoku/`)
 
-### 1.1 Prepare training data
+### 1.1 Generate puzzles
 
-Input is a JSON **array** of puzzles, each with an `original` grid (0 = empty)
-and its `solution` grid (both N×N, N a perfect square):
-
-```json
-[
-  {"original":  [[3,0,0,1], [0,0,3,0], [0,3,0,0], [0,0,0,3]],
-   "solution":  [[3,4,2,1], [2,1,3,4], [1,3,4,2], [4,2,1,3]]}
-]
-```
-
-Generate traces with any of the three strategies (they emit the **same**
-record schema, so the outputs are interchangeable for training):
+`generate_sudoku.py` produces naked-single-solvable puzzles as a
+JSON **array** of `{sudoku_id, original, solution}`, where `original` is the
+grid with blanks (0 = empty) and `solution` is the solved grid (both N×N):
 
 ```bash
-# parallel cell-workers
+python sudoku/generate_sudoku.py --base-n 3 --size 1000 -p 0.5 --out <PUZZLES_JSON>
+```
+
+`--base-n` sets the grid size (`base_n²` × `base_n²`, so `3` → 9×9), `--size`
+the number of unique puzzles, and `-p` the probability of removing a removable
+clue (lower `p` → more clues kept → easier). A record looks like:
+
+```json
+{"sudoku_id": 0,
+ "original":  [[3,0,0,1], [0,0,3,0], [0,3,0,0], [0,0,0,3]],
+ "solution":  [[3,4,2,1], [2,1,3,4], [1,3,4,2], [4,2,1,3]]}
+```
+
+### 1.2 Build training data
+
+Turn the puzzles into multi-agent traces with any of the three strategies (they
+emit the **same** record schema, so the outputs are interchangeable for training):
+
+```bash
+# message-passing
 python sudoku/mplm.py   --input <PUZZLES_JSON> --out <MPLM_TRACES_JSON>   --max-puzzles 1000
-# fork/join master+workers
+# fork/join
 python sudoku/fj.py     --input <PUZZLES_JSON> --out <FJ_TRACES_JSON>     --max-puzzles 1000
-# single-agent chain of thought
+# serial chain of thought
 python sudoku/serial.py --input <PUZZLES_JSON> --out <SERIAL_TRACES_JSON> --max-puzzles 1000
 ```
 
@@ -90,7 +99,7 @@ for `mplm.py`/`fj.py` `--master-upsample`, `--worker-downsample`,
 record contains `{sudoku_id, N, base_n, master_system_prompt,
 worker_system_prompt, original, solution, master[], workers{}}`.
 
-### 1.2 Prepare evaluation data
+### 1.3 Prepare evaluation data
 
 `infer.py` reads a **JSONL** file (one object per line) with the fields
 `sudoku_id`, `initial_prompt`, and `solution`. The prompt format must match
@@ -117,7 +126,7 @@ with open("<PROMPTS_JSONL>", "w") as f:
                             "solution": p["solution"]}) + "\n")
 ```
 
-### 1.3 Run inference
+### 1.4 Run inference
 
 Serve the trained Sudoku model, then evaluate:
 
@@ -146,20 +155,30 @@ total accuracy and average latency (over successful solves). Add `--write_trace
 
 ### 2.1 Prepare data (one file feeds both)
 
-A single SAT-instance **JSONL** serves both training-trace generation and
-evaluation. Each line has:
+Generate raw 3-SAT instances with `generate_sat.py`. SAT instances are
+satisfiable by construction; UNSAT instances are verified with Glucose3
+(requires `pip install python-sat`):
+
+```bash
+python sat/generate_sat.py --num_samples 1000 --min_vars 10 --max_vars 12 \
+    --clause_var_ratio 4.3 --satisfiable_ratio 0.5 --seed 42 --out <INSTANCES_JSONL>
+```
+
+The resulting JSONL serves both training-trace generation and evaluation. Each
+line has:
 
 ```json
 {"id": 0, "num_vars": 10, "num_clauses": 43,
  "problem": "( 7 ∨ 4 ∨ 1 ) ∧ ( ¬ 8 ∨ 9 ∨ 5 ) ∧ ...",
- "answer": true, "label": "SAT",
+ "answer": true, "label": 1,
  "clauses": [[7, 4, 1], [-8, 9, 5], [10, -6, 3]]}
 ```
 
 * `clauses` — raw integer clauses (negative = negated literal); **read by the
   trace generators**.
 * `problem` — the CNF string the model actually sees; `answer` — ground-truth
-  SAT (`true`) / UNSAT (`false`); **read by the evaluator**.
+  SAT (`true`) / UNSAT (`false`); `label` — `1` for SAT, `0` for UNSAT.
+  `problem` and `answer` are **read by the evaluator**.
 
 Generate training traces (`--in`/`--out` required; one JSONL record per LLM call):
 
@@ -204,7 +223,7 @@ Two inference scripts evaluate the **same full benchmark** with two different
 frameworks and share identical task selection, result files, skip/retry logic,
 and grouped stats:
 
-* `run_mplm_longbenchv2.py` — **MPLM multi-round**: split the context into
+* `run_mplm_longbenchv2.py` — **MPLM**: split the context into
   ~10k-token chunks, each read by a reader agent that summarizes it; the master
   then runs `--query-rounds` rounds of `<send>` queries to specific agents
   before giving the final answer.
