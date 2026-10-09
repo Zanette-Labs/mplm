@@ -1,6 +1,6 @@
 # Message Passing Language Model
 
-**[COLM 2026 · Oral Spotlight]** Official Implementation for Paper "Message Passing Enables Efficient Reasoning"
+**[COLM 2026 · Outstanding Paper Award]** Official Implementation for Paper "Message Passing Enables Efficient Reasoning"
 
 [![arXiv](https://img.shields.io/badge/arXiv-2607.01077-b31b1b.svg)](https://arxiv.org/abs/2607.01077) [![Website](https://img.shields.io/badge/Website-MPLM-blue.svg)](https://zanette-labs.github.io/mplm.github.io/)
 
